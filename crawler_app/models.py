@@ -1,6 +1,7 @@
 """결과 형식과 JSON 저장. 확인하지 못한 값은 None으로 둔다."""
 from __future__ import annotations
 
+import csv
 import json
 import os
 from dataclasses import asdict, dataclass, field
@@ -103,3 +104,70 @@ def save_job_json(job: dict[str, Any], path: Path, overwrite: bool = False) -> P
     tmp.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp, path)
     return path
+
+
+CSV_HEADERS = [
+    "출처",
+    "검색어",
+    "제목",
+    "언론사",
+    "날짜 원문",
+    "검색 결과 링크",
+    "원문 링크",
+    "포털 기사 링크",
+    "수집 시각",
+    "추출 방식",
+    "본문 상태",
+    "본문 추출 방식",
+    "본문 수집 시각",
+    "본문 오류",
+    "본문 내용",
+    "검색 결과 설명",
+]
+
+
+def default_csv_path(results_dir: Path, query: str) -> Path:
+    """같은 이름이 있으면 번호를 붙여 기존 CSV 결과를 덮어쓰지 않는다."""
+    safe = "".join(c if c.isalnum() else "_" for c in query)[:30].strip("_") or "query"
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    candidate = results_dir / f"{stamp}_{safe}.csv"
+    n = 2
+    while candidate.exists():
+        candidate = results_dir / f"{stamp}_{safe}_{n}.csv"
+        n += 1
+    return candidate
+
+
+def save_job_csv(job: dict[str, Any], path: Path, overwrite: bool = False) -> Path:
+    """수집된 기사 목록을 CSV 파일로 저장한다. Excel 호환을 위해 utf-8-sig 인코딩을 사용한다."""
+    path = Path(path)
+    if path.exists() and not overwrite:
+        raise FileExistsError(f"이미 존재하는 파일입니다: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(CSV_HEADERS)
+        for site in job.get("sites", []):
+            for item in site.get("items", []):
+                writer.writerow([
+                    item.get("source_name") or "",
+                    item.get("query") or "",
+                    item.get("title") or "",
+                    item.get("press") or "",
+                    item.get("date_text") or "",
+                    item.get("search_link") or "",
+                    item.get("original_link") or "",
+                    item.get("portal_link") or "",
+                    item.get("collected_at") or "",
+                    item.get("extraction_method") or "",
+                    item.get("body_status") or "",
+                    item.get("body_method") or "",
+                    item.get("body_collected_at") or "",
+                    item.get("body_error") or "",
+                    item.get("body_text") or "",
+                    item.get("description") or "",
+                ])
+    os.replace(tmp, path)
+    return path
+

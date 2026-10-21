@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 SITE_ID = "google"
 DISPLAY_NAME = "구글"
 PROFILE_NAME = "google"
-SUPPORTED_SEARCH_TYPES = ("news",)
+SUPPORTED_SEARCH_TYPES = ("news", "web", "blog")
 
 HOME_URL = "https://www.google.com/"
 
@@ -48,6 +48,13 @@ BLOCK_URLS = [re.compile(r"/sorry/"), re.compile(r"^https://consent\.google\.")]
 BLOCK_SELECTORS = ["iframe[src*='recaptcha']", "#captcha-form", "form#captcha-form"]
 BLOCK_TEXTS = ["unusual traffic", "비정상적인 트래픽", "로봇이 아닙니다", "not a robot"]
 PORTAL_DOMAINS = ["google.com", "google.co.kr", "googleusercontent.com", "gstatic.com"]
+
+GOOGLE_PERIOD_MAP = {
+    "1d": "qdr:d",
+    "1w": "qdr:w",
+    "1m": "qdr:m",
+    "1y": "qdr:y",
+}
 
 # 1) 뉴스 카드 구조(div.SoaBEf) → 2) 실패 시 제목 요소를 가진 링크 휴리스틱
 EXTRACT_JS = r"""
@@ -91,17 +98,22 @@ EXTRACT_JS = r"""
 
 
 def resolve_original(href: str) -> str | None:
-    """구글 내부 이동 링크(/url?q=)면 실제 주소를 꺼낸다. 구글 도메인이면 None."""
+    """구글 내부 이동 링크(/url?q=, /goto?url=)면 실제 주소 또는 리다이렉트 게이트웨이 주소를 반환한다.
+    구글 자체 서비스 도메인(검색, 계정 등)이면 None."""
     from urllib.parse import parse_qs, urlparse
 
     parsed = urlparse(href)
-    if common.host_matches(href, PORTAL_DOMAINS) and parsed.path == "/url":
+    is_google = common.host_matches(href, PORTAL_DOMAINS)
+    if is_google and parsed.path == "/goto" and "url=" in parsed.query:
+        # 구글 뉴스의 외부 언론사 리다이렉트 링크 (/goto?url=CAES...)
+        return href
+    if is_google and parsed.path == "/url":
         qs = parse_qs(parsed.query)
         target = (qs.get("q") or qs.get("url") or [None])[0]
         if target and target.startswith(("http://", "https://")) and not common.host_matches(target, PORTAL_DOMAINS):
             return target
         return None
-    if common.host_matches(href, PORTAL_DOMAINS):
+    if is_google:
         return None
     return href
 
@@ -122,7 +134,21 @@ async def run(page: Any, query: str, ctx: "SiteRunContext") -> list[ResultItem]:
         if not SEARCH_URL.search(page.url):
             raise
     await ctx.ensure_accessible(page, _detect)
-    await common.open_tab(page, NEWS_TAB, NEWS_URL, ctx, "뉴스")
+    search_type = getattr(ctx, "search_type", "news")
+    if search_type == "news":
+        await common.open_tab(page, NEWS_TAB, NEWS_URL, ctx, "뉴스")
+    else:
+        ctx.checkpoint("일반 웹 검색 화면 유지")
+    if getattr(ctx, "period", "all") in GOOGLE_PERIOD_MAP:
+        tbs = GOOGLE_PERIOD_MAP[ctx.period]
+        ctx.checkpoint(f"기간 조건 적용({ctx.period})")
+        from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+        parsed = urlparse(page.url)
+        query_dict = dict(parse_qsl(parsed.query))
+        query_dict["tbs"] = tbs
+        new_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, urlencode(query_dict), parsed.fragment))
+        await page.goto(new_url, wait_until="domcontentloaded", timeout=ctx.navigation_timeout_ms)
+        await ctx.ensure_accessible(page, _detect)
     await ctx.ensure_accessible(page, _detect)
     await common.wait_for_results(page, RESULT_READY, _detect, ctx)
 

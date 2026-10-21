@@ -29,6 +29,7 @@ from playwright.async_api import async_playwright
 from .browser import BrowserManager, ProfileInUseError
 from .article import extract_article, valid_article_url
 from .config import AppConfig
+from .dedup import deduplicate_items
 from .models import STATE_LABELS, SiteRunResult, now_iso
 from .sites import SITES
 from .sites.common import SiteBlocked, SiteError
@@ -53,6 +54,12 @@ class _Job:
     waiting: dict[str, asyncio.Event] = field(default_factory=dict)
     browser: BrowserManager | None = None
     extract_body: bool = False
+    deduplicate: bool = True
+    max_results: int = 10
+    period: str = "all"
+    search_type: str = "news"
+    concurrency: int = 1
+    seen_keys: set[str] = field(default_factory=set)
     body_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -64,7 +71,9 @@ class SiteRunContext:
         self._job = job
         self._result = result
         cfg = runner.config
-        self.max_results = cfg.max_results_per_site
+        self.max_results = job.max_results
+        self.period = job.period
+        self.search_type = job.search_type
         self.action_timeout_ms = cfg.action_timeout_ms
         self.navigation_timeout_ms = cfg.navigation_timeout_ms
         self.result_wait_timeout_ms = cfg.result_wait_timeout_ms
@@ -169,7 +178,12 @@ class Runner(QObject):
         return self._job_future is not None and not self._job_future.done()
 
     def submit_job(self, query: str, site_ids: list[str],
-                   extract_body: bool = False) -> tuple[bool, str]:
+                   extract_body: bool = False,
+                   deduplicate: bool = True,
+                   max_results: int | None = None,
+                   period: str = "all",
+                   search_type: str = "news",
+                   concurrency: int | None = None) -> tuple[bool, str]:
         if self._loop is None or self._closed:
             return False, "실행부가 준비되지 않았습니다"
         if self.is_busy():
@@ -180,8 +194,11 @@ class Runner(QObject):
         unknown = [s for s in site_ids if s not in self._sites]
         if not site_ids or unknown:
             return False, f"사이트 선택을 확인하세요 {unknown or ''}".strip()
+        limit = max_results if (max_results and 1 <= max_results <= 50) else self.config.max_results_per_site
+        conc = concurrency if (concurrency in (1, 2)) else self.config.max_concurrency
         self._job_future = asyncio.run_coroutine_threadsafe(
-            self._run_job(query, list(site_ids), extract_body), self._loop)
+            self._run_job(query, list(site_ids), extract_body, deduplicate, limit, period, search_type, conc),
+            self._loop)
         self._job_future.add_done_callback(self._on_job_done)
         self.busy_changed.emit(True)
         return True, "실행 요청됨"
@@ -277,17 +294,24 @@ class Runner(QObject):
             await job.browser.force_close_contexts()
 
     async def _run_job(self, query: str, site_ids: list[str],
-                       extract_body: bool = False) -> dict[str, Any]:
+                       extract_body: bool = False,
+                       deduplicate: bool = True,
+                       max_results: int = 10,
+                       period: str = "all",
+                       search_type: str = "news",
+                       concurrency: int = 1) -> dict[str, Any]:
         cfg = self.config
         results = {
             sid: SiteRunResult(site_id=sid, site_name=self._sites[sid].DISPLAY_NAME)
             for sid in site_ids
         }
         job = _Job(query=query, site_ids=site_ids, cancel_event=asyncio.Event(),
-                   results=results, extract_body=extract_body)
+                   results=results, extract_body=extract_body, deduplicate=deduplicate,
+                   max_results=max_results, period=period, search_type=search_type,
+                   concurrency=concurrency)
         self._job = job
-        logger.info("작업 시작: 검색어=%r, 사이트=%s, 동시 실행=%s, 사이트별 최대=%s건",
-                    query, site_ids, cfg.max_concurrency, cfg.max_results_per_site)
+        logger.info("작업 시작: 검색어=%r, 대상=%s, 사이트=%s, 동시 실행=%s, 사이트별 최대=%s건, 기간=%s",
+                    query, search_type, site_ids, concurrency, max_results, period)
         for result in results.values():
             self._set_state(result, "queued", "실행 대기")
         playwright = None
@@ -295,7 +319,7 @@ class Runner(QObject):
             playwright = await self._playwright_factory().start()
             job.browser = BrowserManager(playwright, cfg.profiles_dir,
                                          cfg.action_timeout_ms, cfg.navigation_timeout_ms)
-            semaphore = asyncio.Semaphore(cfg.max_concurrency)
+            semaphore = asyncio.Semaphore(job.concurrency)
             tasks = [asyncio.create_task(self._run_site(job, semaphore, results[sid]))
                      for sid in site_ids]
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -335,6 +359,10 @@ class Runner(QObject):
                 ctx.checkpoint("페이지 준비")
                 page = context.pages[0] if context.pages else await context.new_page()
                 result.items = await module.run(page, job.query, ctx)
+                if job.deduplicate:
+                    result.items, dup_count = deduplicate_items(result.items, job.seen_keys)
+                    if dup_count > 0:
+                        ctx.info(f"원문 URL 기준 중복 기사 {dup_count}건 제외됨 (남은 수: {len(result.items)}건)")
                 if job.extract_body:
                     for item in result.items:
                         item.body_status = item.processing["body"] = "pending"
@@ -434,18 +462,20 @@ class Runner(QObject):
         return {
             "schema_version": 2,
             "query": job.query,
-            "search_type": cfg.search_type,
+            "search_type": job.search_type,
             "state": overall,
             "started_at": job.started_at,
             "finished_at": now_iso(),
             "settings": {
-                "max_results_per_site": cfg.max_results_per_site,
-                "max_concurrency": cfg.max_concurrency,
+                "max_results_per_site": job.max_results,
+                "max_concurrency": job.concurrency,
+                "search_type": job.search_type,
                 "extract_body": job.extract_body,
                 "body_concurrency": 1,
+                "deduplicate": job.deduplicate,
                 "sort": "사이트 기본 정렬(지정하지 않음)",
-                "period": "지정하지 않음",
+                "period": job.period,
             },
-            "not_implemented": ["핵심 키워드", "본문 요약", "중복 제거", "CSV 내보내기"],
+            "not_implemented": ["핵심 키워드", "본문 요약"],
             "sites": [r.to_dict() for r in job.results.values()],
         }

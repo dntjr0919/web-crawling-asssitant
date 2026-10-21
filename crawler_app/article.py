@@ -14,10 +14,13 @@ from urllib.parse import urlparse
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 MIN_BODY_CHARS = 200
+MIN_PHOTO_CAPTION_CHARS = 20
 BODY_WAIT_MS = 8_000
 
 # 휴리스틱 후보. 사이트별 실제 동작 검증 전이며 body/main 전체를 대체 본문으로 쓰지 않는다.
 BODY_SELECTORS = ("#dic_area", "[itemprop='articleBody']", "article")
+# 일반 기사 본문(200자 이상)이 없을 때만 확인하는 사진 기사 전용 설명 선택자.
+PHOTO_CAPTION_SELECTORS = ("#articleBodyContent .m-auto",)
 BLOCK_SELECTORS = (
     "iframe[src*='recaptcha']", "iframe[src*='hcaptcha']",
     "iframe[src*='captcha']", "#captcha-form", "#captcha",
@@ -32,7 +35,7 @@ BLOCK_PHRASES = (
 # article 요소는 본문 외 요소가 섞일 수 있어 문단만 사용한다.
 # innerText 및 표시 여부를 사용하며 숨겨진 본문·JSON-LD·유료 데이터는 읽지 않는다.
 BODY_JS = r"""
-({selectors, minChars}) => {
+({selectors, minChars, photoSelectors, minPhotoChars}) => {
   const visible = el => {
     if (!el || !el.getClientRects().length) return false;
     const style = getComputedStyle(el);
@@ -41,26 +44,38 @@ BODY_JS = r"""
   const clean = text => (text || '').replace(/\r/g, '')
     .split('\n').map(s => s.replace(/[ \t]+/g, ' ').trim())
     .filter(Boolean).join('\n');
-  for (const selector of selectors) {
-    const matches = [];
-    for (const el of document.querySelectorAll(selector)) {
-      if (!visible(el)) continue;
-      let text;
-      if (selector === 'article') {
-        text = [...el.querySelectorAll('p')].filter(p =>
-          visible(p) && !p.closest('nav, header, footer, aside, figure, form')
-        ).map(p => clean(p.innerText)).filter(Boolean).join('\n\n');
-      } else {
-        text = clean(el.innerText);
+  const findCandidate = (selectorList, minLen, methodPrefix = '') => {
+    for (const selector of selectorList || []) {
+      const rawMatches = [];
+      for (const el of document.querySelectorAll(selector)) {
+        if (!visible(el)) continue;
+        let text;
+        if (selector === 'article') {
+          text = [...el.querySelectorAll('p')].filter(p =>
+            visible(p) && !p.closest('nav, header, footer, aside, figure, form')
+          ).map(p => clean(p.innerText)).filter(Boolean).join('\n\n');
+        } else {
+          text = clean(el.innerText);
+        }
+        if (text.length >= minLen) {
+          rawMatches.push({el, text, method: `${methodPrefix}${selector}`});
+        }
       }
-      if (text.length >= minChars) matches.push({text, method: selector});
+      // 상위 래퍼 div와 하위 실제 텍스트 div가 함께 잡힐 때는 가장 안쪽 요소만 남긴다.
+      const matches = rawMatches.filter(
+        m => !rawMatches.some(other => other.el !== m.el && m.el.contains(other.el))
+      );
+      // 서로 다른 본문 후보가 여러 개면 임의로 합치거나 가장 긴 것을 정답으로 간주하지 않는다.
+      const unique = [...new Map(matches.map(m => [m.text, {text: m.text, method: m.method}])).values()];
+      if (unique.length === 1) return unique[0];
+      if (unique.length > 1) return {ambiguous: true, method: `${methodPrefix}${selector}`};
     }
-    // 서로 다른 본문 후보가 여러 개면 임의로 합치거나 가장 긴 것을 정답으로 간주하지 않는다.
-    const unique = [...new Map(matches.map(m => [m.text, m])).values()];
-    if (unique.length === 1) return unique[0];
-    if (unique.length > 1) return {ambiguous: true, method: selector};
-  }
-  return null;
+    return null;
+  };
+  return (
+    findCandidate(selectors, minChars) ||
+    findCandidate(photoSelectors, minPhotoChars, 'photo:')
+  );
 }
 """
 
@@ -117,14 +132,19 @@ async def extract_article(page: Any, url: str, navigation_timeout_ms: int) -> Bo
         reason = await restriction_reason(page)
         if reason:
             return BodyExtraction("blocked", final_url=page.url, error=reason)
-        args = {"selectors": list(BODY_SELECTORS), "minChars": MIN_BODY_CHARS}
+        args = {
+            "selectors": list(BODY_SELECTORS),
+            "minChars": MIN_BODY_CHARS,
+            "photoSelectors": list(PHOTO_CAPTION_SELECTORS),
+            "minPhotoChars": MIN_PHOTO_CAPTION_CHARS,
+        }
         try:
             handle = await page.wait_for_function(BODY_JS, arg=args, timeout=BODY_WAIT_MS)
         except PlaywrightTimeoutError:
             reason = await restriction_reason(page)
             return BodyExtraction(
                 "blocked" if reason else "failed", final_url=page.url,
-                error=reason or "지원 본문 영역을 찾지 못했거나 본문이 200자 미만",
+                error=reason or "지원 본문(200자 이상) 또는 사진 설명(20자 이상) 영역을 찾지 못함",
             )
         try:
             body = await handle.json_value()

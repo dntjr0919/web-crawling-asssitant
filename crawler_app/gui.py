@@ -7,13 +7,15 @@ from typing import Any
 
 from PySide6.QtCore import QObject, Qt, Signal, Slot
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QFileDialog, QHBoxLayout, QHeaderView, QLabel,
-    QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QSplitter,
+    QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QHeaderView, QLabel,
+    QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QSplitter,
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from .config import AppConfig
-from .models import STATE_LABELS, default_result_path, save_job_json
+from .models import (
+    STATE_LABELS, default_csv_path, default_result_path, save_job_csv, save_job_json,
+)
 from .runner import Runner
 from .sites import SITES
 
@@ -98,25 +100,75 @@ class MainWindow(QMainWindow):
         self.continue_btn = QPushButton("계속")
         self.continue_btn.setToolTip("브라우저에서 직접 확인·조작한 뒤 누르면 화면 상태를 다시 확인하고 재개합니다")
         self.save_btn = QPushButton("JSON 저장")
+        self.save_csv_btn = QPushButton("CSV 저장")
         self.run_btn.clicked.connect(self._on_run)
         self.stop_btn.clicked.connect(self._on_stop)
         self.continue_btn.clicked.connect(self._on_continue)
         self.save_btn.clicked.connect(self._on_save)
-        for btn in (self.run_btn, self.stop_btn, self.continue_btn, self.save_btn):
+        self.save_csv_btn.clicked.connect(self._on_save_csv)
+        for btn in (self.run_btn, self.stop_btn, self.continue_btn, self.save_btn, self.save_csv_btn):
             top.addWidget(btn)
         layout.addLayout(top)
 
+        options_layout = QHBoxLayout()
         self.body_check = QCheckBox("본문 추출 (공개 원문만, 한 건씩)")
         self.body_check.setChecked(False)
         self.body_check.setToolTip(
             "체크하지 않으면 기존 검색 결과만 수집합니다. 언론사별 접근 조건을 확인하세요. "
             "제한·유료벽은 우회하지 않으며 본문 완전성은 직접 확인해야 합니다."
         )
-        layout.addWidget(self.body_check)
+        self.dedup_check = QCheckBox("원문 중복 제거")
+        self.dedup_check.setChecked(True)
+        self.dedup_check.setToolTip(
+            "동일한 원문 URL을 가진 기사가 여러 개 수집되면 최초 1건만 남기고 중복을 제거합니다."
+        )
+        options_layout.addWidget(self.body_check)
+        options_layout.addWidget(self.dedup_check)
+
+        options_layout.addSpacing(15)
+        options_layout.addWidget(QLabel("수집 대상:"))
+        self.type_combo = QComboBox()
+        self.type_combo.addItem("뉴스", "news")
+        self.type_combo.addItem("웹 전체 (통합)", "web")
+        self.type_combo.addItem("블로그", "blog")
+        self.type_combo.setToolTip("수집할 검색 결과 유형")
+        options_layout.addWidget(self.type_combo)
+
+        options_layout.addSpacing(10)
+        options_layout.addWidget(QLabel("최대 건수:"))
+        self.max_results_spin = QSpinBox()
+        self.max_results_spin.setRange(1, 50)
+        self.max_results_spin.setValue(self.config.max_results_per_site)
+        self.max_results_spin.setSuffix("건")
+        self.max_results_spin.setToolTip("사이트별 최대 수집 기사 수 (1~50건)")
+        options_layout.addWidget(self.max_results_spin)
+
+        options_layout.addSpacing(10)
+        options_layout.addWidget(QLabel("검색 기간:"))
+        self.period_combo = QComboBox()
+        self.period_combo.addItem("전체 (기본)", "all")
+        self.period_combo.addItem("1일 (최근 24시간)", "1d")
+        self.period_combo.addItem("1주일", "1w")
+        self.period_combo.addItem("1개월", "1m")
+        self.period_combo.addItem("1년", "1y")
+        self.period_combo.setToolTip("검색 대상 기간 필터")
+        options_layout.addWidget(self.period_combo)
+
+        options_layout.addSpacing(10)
+        options_layout.addWidget(QLabel("동시 실행:"))
+        self.concurrency_spin = QSpinBox()
+        self.concurrency_spin.setRange(1, 2)
+        self.concurrency_spin.setValue(self.config.max_concurrency)
+        self.concurrency_spin.setSuffix("개")
+        self.concurrency_spin.setToolTip("동시에 실행할 브라우저 창 개수 (1~2개)")
+        options_layout.addWidget(self.concurrency_spin)
+
+        options_layout.addStretch()
+        layout.addLayout(options_layout)
 
         info = QLabel(
-            f"사이트별 최대 {self.config.max_results_per_site}건 · 동시 실행 {self.config.max_concurrency} · "
-            "정렬·기간 미지정(사이트 기본) · 본문은 후보 추출, 키워드·요약은 미구현"
+            "수집 대상(뉴스/웹/블로그) · 건수/기간 필터 · 동시 실행(1~2) · 원문 중복 제거 지원 · "
+            "본문은 후보 추출, 키워드·요약은 미구현"
         )
         info.setStyleSheet("color: gray;")
         layout.addWidget(info)
@@ -165,8 +217,14 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(self._busy)
         self.continue_btn.setEnabled(self._busy and self._waiting)
         self.save_btn.setEnabled(not self._busy and self._last_job is not None)
+        self.save_csv_btn.setEnabled(not self._busy and self._last_job is not None)
         self.query_edit.setEnabled(not self._busy)
         self.body_check.setEnabled(not self._busy)
+        self.dedup_check.setEnabled(not self._busy)
+        self.max_results_spin.setEnabled(not self._busy)
+        self.period_combo.setEnabled(not self._busy)
+        self.type_combo.setEnabled(not self._busy)
+        self.concurrency_spin.setEnabled(not self._busy)
         for box in self.site_checks.values():
             box.setEnabled(not self._busy)
 
@@ -177,7 +235,16 @@ class MainWindow(QMainWindow):
             return
         site_ids = [sid for sid, box in self.site_checks.items() if box.isChecked()]
         query = self.query_edit.text()
-        ok, message = self.runner.submit_job(query, site_ids, self.body_check.isChecked())
+        ok, message = self.runner.submit_job(
+            query,
+            site_ids,
+            self.body_check.isChecked(),
+            self.dedup_check.isChecked(),
+            max_results=self.max_results_spin.value(),
+            period=self.period_combo.currentData(),
+            search_type=self.type_combo.currentData(),
+            concurrency=self.concurrency_spin.value(),
+        )
         if not ok:
             QMessageBox.information(self, "실행할 수 없음", message)
             return
@@ -220,6 +287,24 @@ class MainWindow(QMainWindow):
             return
         logger.info("결과 저장: %s", saved)
         self.statusBar().showMessage(f"저장됨: {saved}")
+
+    @Slot()
+    def _on_save_csv(self) -> None:
+        if self._last_job is None:
+            return
+        default = default_csv_path(self.config.results_dir, self._last_job.get("query", ""))
+        default.parent.mkdir(parents=True, exist_ok=True)
+        path, _ = QFileDialog.getSaveFileName(self, "결과 CSV 저장", str(default), "CSV (*.csv)")
+        if not path:
+            return
+        try:
+            saved = save_job_csv(self._last_job, Path(path), overwrite=True)
+        except OSError as exc:
+            QMessageBox.warning(self, "저장 실패", str(exc))
+            logger.error("CSV 결과 저장 실패: %s", exc)
+            return
+        logger.info("CSV 결과 저장: %s", saved)
+        self.statusBar().showMessage(f"CSV 저장됨: {saved}")
 
     # ---------- 실행부 시그널 ----------
     @Slot(str, str, str)

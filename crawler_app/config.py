@@ -9,8 +9,8 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = PROJECT_ROOT / "config.json"
 
-# 현재 구현된 검색 종류. 다른 종류는 사이트 모듈에 추가한 뒤 여기에 등록한다.
-SUPPORTED_SEARCH_TYPES = ("news",)
+# 현재 지원하는 검색 대상 종류
+SUPPORTED_SEARCH_TYPES = ("news", "web", "blog")
 
 logger = logging.getLogger(__name__)
 
