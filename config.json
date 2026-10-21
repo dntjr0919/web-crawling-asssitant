@@ -1,0 +1,18 @@
+{
+  "max_results_per_site": 10,
+  "max_concurrency": 1,
+  "search_type": "news",
+  "action_timeout_ms": 10000,
+  "navigation_timeout_ms": 30000,
+  "result_wait_timeout_ms": 15000,
+  "manual_wait_timeout_sec": 300,
+  "max_manual_rounds": 3,
+  "shutdown_timeout_sec": 30,
+  "profiles_dir": "profiles",
+  "results_dir": "results",
+  "logs_dir": "logs",
+  "enabled_sites": {
+    "naver": true,
+    "google": true
+  }
+}
