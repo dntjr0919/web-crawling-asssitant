@@ -78,9 +78,12 @@ EXTRACT_JS = r"""
   for (const a of root.querySelectorAll('a[href]')) {
     const href = abs(a.getAttribute('href'));
     if (!href) continue;
-    let host = '';
-    try { host = new URL(href).hostname; } catch (e) { continue; }
-    if (/^(search|www|m|keep|help|nid)\.naver\.com$/.test(host)) continue;
+    let parsed;
+    try { parsed = new URL(href); } catch (e) { continue; }
+    const host = parsed.hostname.toLowerCase();
+    if (host === 'naver.com' || host.endsWith('.naver.com') ||
+        host === 'naver.net' || host.endsWith('.naver.net')) continue;
+    if (!parsed.pathname || parsed.pathname === '/') continue;
     const title = clean(a.textContent);
     if (title.length < 15 || title.length > 200) continue;
     push({ method: 'naver_link_heuristic', title, href, portal_href: null,
@@ -105,7 +108,7 @@ async def run(page: Any, query: str, ctx: "SiteRunContext") -> list[ResultItem]:
     await common.wait_for_results(page, RESULT_READY, _detect, ctx)
 
     ctx.checkpoint("결과 추출")
-    raw = await page.evaluate(EXTRACT_JS, ctx.max_results)
+    raw = await page.evaluate(EXTRACT_JS, ctx.max_results) or []
     ctx.final_url = page.url
     items: list[ResultItem] = []
     for row in raw[: ctx.max_results]:
