@@ -9,8 +9,9 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = PROJECT_ROOT / "config.json"
 
-# 현재 지원하는 검색 대상 종류
+# 현재 지원하는 검색 대상 종류 및 정렬 기준
 SUPPORTED_SEARCH_TYPES = ("news", "web", "blog")
+SUPPORTED_SORT_TYPES = ("relevance", "date")
 
 logger = logging.getLogger(__name__)
 
@@ -18,9 +19,10 @@ logger = logging.getLogger(__name__)
 @dataclass
 class AppConfig:
     max_results_per_site: int = 10
-    # 동시 실행 수. 1이 기본이며 2는 사용자 검증 대기 상태다.
     max_concurrency: int = 1
     search_type: str = "news"
+    sort: str = "relevance"
+    require_login: bool = False
     action_timeout_ms: int = 10_000
     navigation_timeout_ms: int = 30_000
     result_wait_timeout_ms: int = 15_000
@@ -75,8 +77,18 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
     d = AppConfig()
     search_type = raw.get("search_type", d.search_type)
     if search_type not in SUPPORTED_SEARCH_TYPES:
-        warnings.append(f"search_type={search_type!r}: 미구현이므로 'news' 사용")
+        warnings.append(f"search_type={search_type!r}: 지원하지 않는 값이므로 'news' 사용")
         search_type = "news"
+
+    sort = raw.get("sort", d.sort)
+    if sort not in SUPPORTED_SORT_TYPES:
+        warnings.append(f"sort={sort!r}: 지원하지 않는 값이므로 'relevance' 사용")
+        sort = "relevance"
+
+    require_login = raw.get("require_login", d.require_login)
+    if not isinstance(require_login, bool):
+        warnings.append(f"require_login={require_login!r}: 불리언이 아니어서 False 사용")
+        require_login = False
 
     enabled = dict(d.enabled_sites)
     raw_enabled = raw.get("enabled_sites", {})
@@ -89,6 +101,8 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
         max_results_per_site=_int_in_range(raw, "max_results_per_site", d.max_results_per_site, 1, 50, warnings),
         max_concurrency=_int_in_range(raw, "max_concurrency", d.max_concurrency, 1, 2, warnings),
         search_type=search_type,
+        sort=sort,
+        require_login=require_login,
         action_timeout_ms=_int_in_range(raw, "action_timeout_ms", d.action_timeout_ms, 1_000, 60_000, warnings),
         navigation_timeout_ms=_int_in_range(raw, "navigation_timeout_ms", d.navigation_timeout_ms, 5_000, 120_000, warnings),
         result_wait_timeout_ms=_int_in_range(raw, "result_wait_timeout_ms", d.result_wait_timeout_ms, 1_000, 120_000, warnings),

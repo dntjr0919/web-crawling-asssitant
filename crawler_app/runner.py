@@ -26,13 +26,14 @@ from PySide6.QtCore import QObject, Signal
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import async_playwright
 
-from .browser import BrowserManager, ProfileInUseError
 from .article import extract_article, valid_article_url
+from .browser import BrowserManager, ProfileInUseError
 from .config import AppConfig
 from .dedup import deduplicate_items
-from .models import STATE_LABELS, SiteRunResult, now_iso
+from .models import ResultItem, STATE_LABELS, SiteRunResult, now_iso
+from .nlp import extract_keywords, summarize_text
 from .sites import SITES
-from .sites.common import SiteBlocked, SiteError
+from .sites.common import SiteBlocked, SiteError, host_of
 
 logger = logging.getLogger(__name__)
 site_logger = logging.getLogger("crawler_app.site")
@@ -57,10 +58,28 @@ class _Job:
     deduplicate: bool = True
     max_results: int = 10
     period: str = "all"
+    sort: str = "relevance"
     search_type: str = "news"
     concurrency: int = 1
+    require_login: bool = False
     seen_keys: set[str] = field(default_factory=set)
     body_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+def _apply_snippet_keywords(item: ResultItem, fallback_status: str) -> None:
+    """본문이 없을 때 제목·검색 설명에서 키워드를 추출하고 입력 출처를 명시적으로 기록한다.
+    검색 설명을 본문이나 본문 요약으로 대체하지 않는다."""
+    kws = extract_keywords(item.description, title=item.title, top_k=5)
+    item.keywords = kws
+    if kws:
+        item.keywords_source = "title_description" if item.description else "title_only"
+        item.processing["keywords"] = "extracted_from_snippet"
+    else:
+        item.keywords_source = "none"
+        item.processing["keywords"] = fallback_status
+    item.summary = None
+    item.summary_source = "none"
+    item.processing["summary"] = fallback_status
 
 
 class SiteRunContext:
@@ -73,7 +92,9 @@ class SiteRunContext:
         cfg = runner.config
         self.max_results = job.max_results
         self.period = job.period
+        self.sort = job.sort
         self.search_type = job.search_type
+        self.require_login = job.require_login
         self.action_timeout_ms = cfg.action_timeout_ms
         self.navigation_timeout_ms = cfg.navigation_timeout_ms
         self.result_wait_timeout_ms = cfg.result_wait_timeout_ms
@@ -87,6 +108,22 @@ class SiteRunContext:
     @final_url.setter
     def final_url(self, value: str | None) -> None:
         self._result.final_url = value
+
+    @property
+    def logged_in(self) -> bool | None:
+        return self._result.logged_in
+
+    @logged_in.setter
+    def logged_in(self, value: bool | None) -> None:
+        self._result.logged_in = value
+
+    @property
+    def pages_collected(self) -> int:
+        return self._result.pages_collected
+
+    @pages_collected.setter
+    def pages_collected(self, value: int) -> None:
+        self._result.pages_collected = value
 
     def checkpoint(self, step: str) -> None:
         if self._job.cancel_event.is_set():
@@ -117,7 +154,6 @@ class SiteRunContext:
                 return_when=asyncio.FIRST_COMPLETED,
             )
         finally:
-            # 여기서 취소하는 것은 asyncio 대기 태스크뿐이며 Playwright 호출이 아니다.
             for task in (cancel_wait, continue_wait):
                 if not task.done():
                     task.cancel()
@@ -183,7 +219,9 @@ class Runner(QObject):
                    max_results: int | None = None,
                    period: str = "all",
                    search_type: str = "news",
-                   concurrency: int | None = None) -> tuple[bool, str]:
+                   concurrency: int | None = None,
+                   sort: str = "relevance",
+                   require_login: bool = False) -> tuple[bool, str]:
         if self._loop is None or self._closed:
             return False, "실행부가 준비되지 않았습니다"
         if self.is_busy():
@@ -197,7 +235,10 @@ class Runner(QObject):
         limit = max_results if (max_results and 1 <= max_results <= 50) else self.config.max_results_per_site
         conc = concurrency if (concurrency in (1, 2)) else self.config.max_concurrency
         self._job_future = asyncio.run_coroutine_threadsafe(
-            self._run_job(query, list(site_ids), extract_body, deduplicate, limit, period, search_type, conc),
+            self._run_job(
+                query, list(site_ids), extract_body, deduplicate,
+                limit, period, search_type, conc, sort, require_login,
+            ),
             self._loop)
         self._job_future.add_done_callback(self._on_job_done)
         self.busy_changed.emit(True)
@@ -252,7 +293,7 @@ class Runner(QObject):
     def _on_job_done(self, future: concurrent.futures.Future) -> None:
         try:
             summary = future.result()
-        except Exception as exc:  # _run_job 내부 버그 등
+        except Exception as exc:
             logger.exception("작업 처리 중 예상하지 못한 오류")
             summary = {"state": "failed", "error": str(exc), "sites": []}
         self.job_finished.emit(summary)
@@ -299,19 +340,26 @@ class Runner(QObject):
                        max_results: int = 10,
                        period: str = "all",
                        search_type: str = "news",
-                       concurrency: int = 1) -> dict[str, Any]:
+                       concurrency: int = 1,
+                       sort: str = "relevance",
+                       require_login: bool = False) -> dict[str, Any]:
         cfg = self.config
         results = {
             sid: SiteRunResult(site_id=sid, site_name=self._sites[sid].DISPLAY_NAME)
             for sid in site_ids
         }
-        job = _Job(query=query, site_ids=site_ids, cancel_event=asyncio.Event(),
-                   results=results, extract_body=extract_body, deduplicate=deduplicate,
-                   max_results=max_results, period=period, search_type=search_type,
-                   concurrency=concurrency)
+        job = _Job(
+            query=query, site_ids=site_ids, cancel_event=asyncio.Event(),
+            results=results, extract_body=extract_body, deduplicate=deduplicate,
+            max_results=max_results, period=period, sort=sort,
+            search_type=search_type, concurrency=concurrency,
+            require_login=require_login,
+        )
         self._job = job
-        logger.info("작업 시작: 검색어=%r, 대상=%s, 사이트=%s, 동시 실행=%s, 사이트별 최대=%s건, 기간=%s",
-                    query, search_type, site_ids, concurrency, max_results, period)
+        logger.info(
+            "작업 시작: 검색어=%r, 대상=%s, 사이트=%s, 동시 실행=%s, 사이트별 최대=%s건, 기간=%s, 정렬=%s, 로그인확인=%s",
+            query, search_type, site_ids, concurrency, max_results, period, sort, require_login,
+        )
         for result in results.values():
             self._set_state(result, "queued", "실행 대기")
         playwright = None
@@ -359,20 +407,42 @@ class Runner(QObject):
                 ctx.checkpoint("페이지 준비")
                 page = context.pages[0] if context.pages else await context.new_page()
                 result.items = await module.run(page, job.query, ctx)
+                for item in result.items:
+                    if not item.search_type:
+                        item.search_type = job.search_type
+                    if not item.domain:
+                        item.domain = host_of(item.original_link or item.search_link) or None
                 if job.deduplicate:
                     result.items, dup_count = deduplicate_items(result.items, job.seen_keys)
                     if dup_count > 0:
-                        ctx.info(f"원문 URL 기준 중복 기사 {dup_count}건 제외됨 (남은 수: {len(result.items)}건)")
+                        ctx.info(f"원문 URL 기준 중복 항목 {dup_count}건 제외됨 (남은 수: {len(result.items)}건)")
                 if job.extract_body:
                     for item in result.items:
                         item.body_status = item.processing["body"] = "pending"
-                    # 사이트 동시 실행 수가 2여도 본문 가져오기는 작업 전체에서 항상 한 건씩.
+                        item.processing["keywords"] = "pending"
+                        item.processing["summary"] = "pending"
                     async with job.body_lock:
                         await self._extract_bodies(context, result, ctx)
-                message = f"{len(result.items)}건 수집"
+                else:
+                    for item in result.items:
+                        _apply_snippet_keywords(item, "not_requested")
+
+                pages_note = f" ({result.pages_collected}페이지)" if result.pages_collected > 1 else ""
+                login_note = " · 로그인됨" if result.logged_in else ""
+                message = f"{len(result.items)}건 수집{pages_note}{login_note}"
                 if job.extract_body:
-                    count = sum(item.body_status == "extracted" for item in result.items)
-                    message += f" / 본문 후보 {count}건, 나머지 {len(result.items) - count}건 상세 확인"
+                    ext_count = sum(item.body_status == "extracted" for item in result.items)
+                    unsup_count = sum(item.body_status == "unsupported" for item in result.items)
+                    blk_count = sum(item.body_status == "blocked" for item in result.items)
+                    fail_count = sum(item.body_status == "failed" for item in result.items)
+                    parts = [f"본문 {ext_count}건"]
+                    if unsup_count:
+                        parts.append(f"미지원 {unsup_count}건")
+                    if blk_count:
+                        parts.append(f"접근제한 {blk_count}건")
+                    if fail_count:
+                        parts.append(f"실패 {fail_count}건")
+                    message += " / " + " · ".join(parts)
                 self._set_state(result, "done", message)
             except JobCancelled:
                 self._set_state(result, "cancelled", "중지 요청으로 종료")
@@ -397,6 +467,8 @@ class Runner(QObject):
                     for item in result.items:
                         if item.body_status in ("pending", "processing"):
                             item.body_status = item.processing["body"] = "cancelled"
+                            item.processing["keywords"] = "cancelled"
+                            item.processing["summary"] = "cancelled"
                             item.body_error = "중지 요청으로 미처리"
                 if result.final_url is None and page is not None:
                     try:
@@ -409,12 +481,13 @@ class Runner(QObject):
 
     async def _extract_bodies(self, context: Any, result: SiteRunResult,
                               ctx: SiteRunContext) -> None:
-        """검색 결과를 보존하면서 기사별 본문 실패를 격리한다."""
+        """검색 결과를 보존하면서 항목별 본문 추출을 격리하고, 입력 출처를 구분해 키워드·요약을 생성한다."""
         for index, item in enumerate(result.items, 1):
             ctx.checkpoint(f"본문 추출 {index}/{len(result.items)}")
             if not valid_article_url(item.original_link):
                 item.body_status = item.processing["body"] = "skipped"
                 item.body_error = "확인된 원문 링크 없음; 검색 설명으로 대체하지 않음"
+                _apply_snippet_keywords(item, "skipped")
                 continue
             item.body_status = item.processing["body"] = "processing"
             article_page = None
@@ -429,10 +502,27 @@ class Runner(QObject):
                 item.body_error = body.error
                 item.body_final_url = body.final_url
                 item.body_method = body.method
-                if body.status == "extracted":
+                if body.final_url and (not item.domain or "google." in (item.domain or "")):
+                    resolved_dom = host_of(body.final_url)
+                    if resolved_dom:
+                        item.domain = resolved_dom
+                        if not item.press or "google." in item.press:
+                            item.press = resolved_dom
+
+                if body.status == "extracted" and body.text:
                     item.body_collected_at = now_iso()
-                    ctx.info(f"본문 후보 추출 {index}: {len(body.text or '')}자")
+                    item.keywords = extract_keywords(body.text, title=item.title, top_k=5)
+                    item.keywords_source = "body" if item.keywords else "none"
+                    item.summary = summarize_text(body.text, title=item.title, max_sentences=3)
+                    item.summary_source = "body" if item.summary else "none"
+                    item.processing["keywords"] = "extracted_from_body" if item.keywords else "empty"
+                    item.processing["summary"] = "extracted_from_body" if item.summary else "empty"
+                    ctx.info(
+                        f"본문 추출 {index}: {len(body.text)}자 ({body.method}) "
+                        f"/ 키워드 {len(item.keywords)}개, 요약 {len(item.summary or '')}자"
+                    )
                 else:
+                    _apply_snippet_keywords(item, body.status)
                     ctx.warning(f"본문 {index}: {body.status} / {body.error}")
             except JobCancelled:
                 raise
@@ -440,13 +530,14 @@ class Runner(QObject):
                 ctx.checkpoint(f"본문 오류 확인 {index}/{len(result.items)}")
                 item.body_status = item.processing["body"] = "failed"
                 item.body_error = f"{type(exc).__name__}: {exc}"
+                _apply_snippet_keywords(item, "failed")
                 ctx.warning(f"본문 {index}: {item.body_error}")
             finally:
                 if article_page is not None:
                     try:
                         await article_page.close()
                     except Exception as exc:
-                        ctx.warning(f"기사 탭 종료: {exc}")
+                        ctx.warning(f"상세 탭 종료: {exc}")
 
     def _summary(self, job: _Job) -> dict[str, Any]:
         states = [r.state for r in job.results.values()]
@@ -458,9 +549,9 @@ class Runner(QObject):
             overall = "partial"
         else:
             overall = "failed"
-        cfg = self.config
+        sort_label = "최신순" if job.sort == "date" else "관련도순(기본)"
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "query": job.query,
             "search_type": job.search_type,
             "state": overall,
@@ -473,9 +564,10 @@ class Runner(QObject):
                 "extract_body": job.extract_body,
                 "body_concurrency": 1,
                 "deduplicate": job.deduplicate,
-                "sort": "사이트 기본 정렬(지정하지 않음)",
+                "sort": sort_label,
                 "period": job.period,
+                "require_login": job.require_login,
             },
-            "not_implemented": ["핵심 키워드", "본문 요약"],
+            "not_implemented": [],
             "sites": [r.to_dict() for r in job.results.values()],
         }

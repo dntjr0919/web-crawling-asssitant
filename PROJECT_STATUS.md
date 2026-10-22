@@ -1,93 +1,69 @@
 # PROJECT_STATUS
 
 ## 목표와 확정 기술
-Windows 로컬 데스크톱 브라우저 자동화·동적 크롤링 오케스트레이터. 뉴스 검색은 첫 사용 사례.
-Python 3.12.10 + PySide6 6.12.0 + Playwright 1.64.0 async API + asyncio. 설정·결과 JSON, 표준 logging.
+Windows 로컬 데스크톱 브라우저 자동화·동적 크롤링 오케스트레이터. 뉴스·웹·블로그 검색 및 본문/키워드/요약 추출 지원.
+Python 3.12+ + PySide6 6.12.0 + Playwright 1.64.0 async API + asyncio. 설정·결과 JSON/CSV, 표준 logging.
 API 수집기로 교체하지 않음. DB·서버·LLM·Docker 미사용.
 
 ## 실행 방법
 - 설치: `& '.\.venv\Scripts\python.exe' -m pip install -r requirements.txt`
 - 시작: `& '.\.venv\Scripts\python.exe' main.py`
+- 검증 테스트(단위·고정 HTML·GUI 위젯): `& '.\.venv\Scripts\python.exe' test_all.py`
 
 ## 파일 역할
 - main.py: 앱 시작, 로그 설정(logs/app.log)
-- config.json: 사이트별 최대 건수(10), 동시 실행 수(기본 1, 최대 2), 시간 제한, 저장 위치
-- crawler_app/gui.py: PySide6 화면(검색어·사이트 선택·실행/중지/계속·상태·로그·결과·상세·JSON 저장)
-- crawler_app/runner.py: 전용 스레드의 asyncio 실행부, 오케스트레이터, 취소·사용자 대기
+- config.json: 사이트별 최대 건수(10), 동시 실행 수(기본 1, 최대 2), 검색 유형, 정렬 기준, 로그인 확인 옵션, 시간 제한, 저장 위치
+- crawler_app/gui.py: PySide6 화면(검색어·사이트 자동 추천·사이트 선택·실행/중지/계속·JSON/CSV 저장·저장 폴더 열기·목록 행별 링크 열기·뉴스형/일반형 상세 화면 분리·4분할 패널 레이아웃 프리셋/개별 제어 및 상세 패널 미닫이 슬라이딩 애니메이션 토글)
+- crawler_app/runner.py: 전용 스레드의 asyncio 실행부, 오케스트레이터, 취소·사용자 대기, 본문·키워드·요약 후처리 및 입력 출처 구분 연동
 - crawler_app/browser.py: 사이트별 전용 프로필(profiles/), 프로필 중복 사용 잠금
-- crawler_app/models.py: 결과 형식, JSON 저장(기존 파일 보호)
-- crawler_app/article.py: 공개 원문 본문 후보 추출, 기사별 실패·접근 제한 기록
-- crawler_app/sites/common.py: 사이트 공통 동작(검색 입력, 탭 이동, 결과 대기, 제한 화면 판정)
-- crawler_app/sites/naver.py, google.py: 사이트 구조 의존 선택자와 추출
-- open_naver.py, verify_browser.py: 이전 단계 테스트용 스크립트(보존)
+- crawler_app/models.py: 결과 형식(도메인·검색 유형·키워드/요약 입력 출처 포함, 기존 JSON 하위 호환 유지), JSON/CSV 저장(기존 파일 보호)
+- crawler_app/article.py: 공개 원문 본문 추출(뉴스·블로그 `#mainFrame`/`#cafe_main` + 일반 웹 주요 콘텐츠 선택자 및 텍스트 밀도 기반 추출), 메뉴·광고·관련 글 노이즈 정제, 상태 구분(`extracted`/`unsupported`/`blocked`/`failed`/`skipped`)
+- crawler_app/dedup.py: 원문 URL 정규화 및 중복 항목 제거
+- crawler_app/nlp.py: 로컬 규칙·통계 기반 핵심 키워드 추출 및 3문장 추출 요약(광고·목차·관련 글·상투어 정제)
+- crawler_app/selector.py: 검색어 키워드·규칙 기반 사이트 및 수집 대상 자동 추천 로직
+- crawler_app/sites/common.py: 사이트 공통 동작(검색 입력, 탭 이동, 결과 대기, 제한 화면 판정, 전용 프로필 로그인 상태 판정 및 수동 로그인 대기·재개)
+- crawler_app/sites/naver.py, google.py: 사이트별 선택자·추출(통합 웹 검색 블록/SDS 카드 대응, '새 창 열림' 제거, 저작권·프로필 홈 링크 제외), 기간/정렬 필터, 다중 페이지네이션, 로그인 여부 판정
+- open_naver.py, verify_browser.py, test_all.py: 동작 및 통합 검증 스크립트
 
-## 사용자 검증 완료
-- 사용자 VS Code: .venv Python 3.12.10, Playwright 1.64.0, Chromium 설치
-- open_naver.py: 네이버 홈 접속(HTTP 200, 제목 NAVER), 검색 실행과 정상 검색 결과 표시
-- verify_browser.py: 15초 유지 및 정상 종료
-- MVP 앱(main.py): PySide6 6.12.0 설치, 앱 시작, 첫 테스트 순서 1~5 사용자 확인
-  - 네이버: 검색 → 뉴스 탭 → 결과 수집·표시, 상세 보기, JSON 저장
-  - 구글: CAPTCHA 표시 → '사용자 확인 필요'로 대기 → 사용자가 직접 인증 후 '계속' → 재개·수집
-  - 실행 중 중지: 정상 동작
-- 본문 추출 확장: 첫 사용자 실행 확인 완료
-  - 보이는 본문 영역(#dic_area, itemprop=articleBody, article의 문단)만 후보로 사용.
-  - 본문 결과를 포함한 JSON 저장 정상.
-- 네이버 비기사 링크 필터링 보강 (사용자 확인 완료):
-  - `crawler_app/sites/naver.py`의 `EXTRACT_JS` 내 `naver_link_heuristic` 수정.
-  - `*.naver.com`, `*.naver.net` 및 도메인 루트(`/`) 링크를 검색 결과 후보에서 제외.
-  - 네이버 언론사 구독 페이지(`media.naver.com`) 유입으로 인한 본문 추출 건너뜀(`skipped`) 항목 제거 확인.
-- 사진 기사 설명 추출 지원 (뉴스1 검증 완료):
-  - `crawler_app/article.py`의 `PHOTO_CAPTION_SELECTORS`를 `#articleBodyContent .m-auto`로 수정.
-  - 뉴스1 사진 기사(https://www.news1.kr/photos/8172144)에서 정상 추출(`status: extracted`, `method: photo:#articleBodyContent .m-auto`) 검증 완료.
-- 원문 URL 기준 수집 결과 중복 제거 구현 및 검증 완료:
-  - `crawler_app/dedup.py` 신규 생성: URL 정규화(프로토콜/호스트 정리, 트래킹 파라미터 정제) 및 고유 식별 키 추출(`original_link` 우선).
-  - `crawler_app/runner.py`: 사이트별 수집 후 및 사이트 간 수집 시 중복 기사 자동 제거, 중복된 기사의 본문 추출 낭비 방지.
-  - `crawler_app/gui.py`: '원문 중복 제거' 체크박스(기본 True) 추가 연동.
-  - 단위 테스트 및 러너 통합 테스트 통과 확인.
-- 결과 CSV 내보내기 기능 구현 및 검증 완료:
-  - `crawler_app/models.py`: `save_job_csv`, `default_csv_path` 구현 (Excel 한글 깨짐 방지 UTF-8 BOM `utf-8-sig` 적용).
-  - `crawler_app/gui.py`: 'CSV 저장' 버튼 추가 연동.
-  - 단위 테스트(BOM 헤더 및 데이터 컬럼 일치 검증) 통과 확인.
-- 검색 건수 및 기간 GUI 설정 연동 구현 및 검증 완료:
-  - `crawler_app/gui.py`: 최대 건수(1~50건 SpinBox), 기간(전체/1일/1주/1개월/1년 ComboBox) 컨트롤 추가.
-  - `crawler_app/runner.py`: `_Job` 및 `SiteRunContext`에 `max_results`와 `period` 전달 연동.
-  - `crawler_app/sites/naver.py`, `google.py`: 기간 파라미터(네이버 `pd`/`nso`, 구글 `tbs`) 자동 적용.
-  - 네이버 대상 실제 1일(1d), 3건 지정 검색 및 수집 검증 통과 확인.
-- 구글 본문 추출 복구 및 수집 대상(뉴스/웹/블로그) 선택 기능 구현 완료:
-  - `crawler_app/sites/google.py`: 구글 뉴스의 게이트웨이 링크(`/goto?url=...`)를 원문 링크로 정상 판별하여 본문 추출 실패 문제 해결.
-  - `crawler_app/gui.py`: '수집 대상'(뉴스/웹 전체/블로그) 선택 콤보박스 및 '동시 실행'(1~2개) 스핀박스 추가.
-  - `crawler_app/sites/naver.py`, `google.py`: 뉴스/웹/블로그 대상별 탭 및 선택자 연동, 블로그 글 링크(`blog.naver.com`) 원문 링크 지원.
-  - 블로그 수집 실제 통합 테스트 통과 확인.
+## 구현 및 검증 완료 항목
+- MVP 앱(main.py), 원문 URL 중복 제거, CSV/JSON 내보내기, 검색 건수·기간·정렬·수집 대상·동시 실행·사이트 자동 추천·로그인 확인·페이지네이션 구현 완료
+- 2026-10-22 실사용 피드백 4대 개선 반영 및 검증 완료:
+  1. **웹 전체(통합) 검색 및 일반 웹페이지 주요 콘텐츠 수집 개선**:
+     - `naver.py`, `google.py`: 통합 웹 검색 카드(`.total_wrap`, `.desktop_mode` SDS 구조, `div.MjjYud` 등)에서 제목 내 `'새 창 열림'` 및 브레드크럼 제거, 지도 저작권(`openstreetmap.org/copyright`) 및 카페/블로그 홈 프로필 링크 제외, 설명·출처·날짜 추출 보강.
+     - `article.py`, `nlp.py`: 뉴스/블로그 선택자 외 일반 웹 주요 콘텐츠 선택자(`.board_view`, `#contents`, `main` 등) 및 텍스트 밀도(`web:density`) 추출 추가. 메뉴·광고·관련 글 목록·인라인 광고 문구 정제.
+     - 상태 세분화(`extracted` / `unsupported`[유튜브·인스타그램·지도·첨부파일 등] / `blocked` / `failed` / `skipped`) 및 키워드·요약 입력 출처(`keywords_source`, `summary_source`) 명시 구분.
+  2. **오른쪽 상세 화면 분리**:
+     - `gui.py`: `search_type == "news"`일 때만 뉴스형 상세 화면을 적용하고, `web`·`blog`는 일반형(제목, 사이트명/도메인, 링크, 게시일 vs 수집 시각, 검색 설명, 키워드[출처 표시], 요약[출처 표시], 주요 내용, 처리 상태)으로 분리.
+  3. **왼쪽 목록 '링크 열기' 추가**:
+     - `gui.py`: 결과 목록 마지막 열에 `'링크 열기'` 버튼을 배치하여 행 선택(상세 표시)과 분리. 유효한 원문 URL(`original_link`/`body_final_url`) 우선, 없으면 `search_link` 대체, `http`/`https`만 허용.
+  4. **우측 상단 '저장 폴더 열기' 추가**:
+     - `gui.py`: 상단 버튼 바에 `'저장 폴더 열기'` 버튼 추가. 사용자가 다른 경로로 내보낸 경우 해당 폴더(`_last_saved_dir`)를 우선 반영하여 Windows 탐색기로 열기.
+- 2026-10-22 4분할 패널 UI 및 상세 토글 개선 반영·검증 완료:
+  1. **4개 패널 번호 체계**:
+     - `1번 패널`(최상단): 사이트 실행 상태·메시지 테이블 (`panel_1` / `site_table`)
+     - `2번 패널`(중앙 좌측): 크롤링 결과 목록 (`panel_2` / `result_table`)
+     - `3번 패널`(중앙 우측): 상세 내용 표시 (`panel_3` / `detail`)
+     - `4번 패널`(최하단): 실행 로그 (`panel_4` / `log_view`)
+  2. **우측 상단 패널 형태 설정 버튼(시각적 사각형 아이콘)**:
+     - 각 패널 영역의 활성화 여부가 사각형 배치 아이콘으로 그려진 소형 프리셋 버튼 3종(`전체 활성화 {1,2,3,4}` / `1,2번 패널 활성화 {1,2}` / `2,4번 패널 활성화 {2,4}`) 추가.
+  3. **2번 패널 결과 행 클릭 시 3번 패널 토글 동작 및 미닫이(슬라이딩) 애니메이션**:
+     - 2번 패널의 결과 행 클릭 시 3번 패널에 상세 내용을 표시하고, 이미 3번 패널에 해당 행의 상세 내용이 열려 있는 상태에서 같은 행을 다시 클릭하면 3번 패널이 미닫이문처럼 부드럽게 닫힘(가로 슬라이딩 아웃).
+     - 다른 행을 클릭하거나 3번 패널이 닫혀 있을 때 클릭하면 해당 행의 상세 내용으로 갱신되며 3번 패널이 스르륵 열림(가로 슬라이딩 인).
+     - `QVariantAnimation` + `QEasingCurve.Type.OutCubic` 적용(지속시간 220ms), 사용자가 수동 조정한 너비 기억 및 즉시 모드(`animations_enabled=False`) 겸용 지원.
+  4. **각 패널(1~4번) 우측 상단 개별 제어 아이콘 버튼**:
+     - 각 패널 헤더 우측 상단에 `전체`(해당 패널만 전체 확장) / `기본`(1~4번 모두 함께 보임) / `숨기기`(해당 패널 숨김) 소형 사각형 아이콘 버튼 추가 및 동작 연결.
 
-## 사용자 검증 대기
-- 본문 추출 전체 언론사 지원과 추출 결과의 텍스트 완전성 검증
-- max_concurrency=2 실제 브라우저 동시 실행
-- 사이트 화면 구조 변경 시 선택자 대응
-- 대기 시간 초과, 창 닫기 중 정리 동작의 실제 화면 확인
-
-## Perplexity Computer 실행 환경(Perplexity Computer로 실행한 경우에 해당)
-- 가상환경 Python 및 Playwright 실행: 정상 동작 확인 완료.
-- 테스트 정책: 단위 테스트나 로직 검증은 환경 내에서 직접 Headless 모드로 실행·검증하며, GUI 조작이나 실제 사용자 확인이 꼭 필요한 항목만 사용자에게 요청함.
-
-## 알려진 제약
-- 네이버 이용약관은 사전 허락 없는 자동화 검색을 제한함
-- Google 약관은 robots.txt 위반 자동화 접근을 금지하며, robots.txt가 /search를 Disallow 함
-- 구글 CAPTCHA는 사용자 직접 인증 후 재개 방식만 사용하며 자동 해결·회피는 구현하지 않음
-- 정렬 조건 미적용(사이트 기본 정렬 사용, 기간 필터는 전체/1일/1주/1개월/1년 지원)
-- 페이지네이션 미적용(현재는 검색 결과 1페이지에 노출된 항목 중에서 최대 건수만큼 수집, 네이버는 약 20~30건, 구글은 10건 내외)
-- 언론사별 이용약관·접근 허용 범위는 별도 확인 필요. 모든 언론사 지원·유료벽/인증 자동 판별을 보장하지 않음
-- 본문 후보가 여러 개이거나 200자 미만이면 실패로 기록. 본문 준비 대기 8초, 페이지 이동은 기존 제한 시간 사용
-- 로그인 판정은 미지원(현재 두 사이트 공개 검색만 사용). 비밀번호 저장·자동 입력 없음
-- 진행 중 Playwright 호출은 브라우저를 닫아서 중단함
-
-## 확인된 미지원 사례
-- 없음 (추가 미지원 언론사 또는 레이아웃 발견 시 추가)
-
-## 향후 후보(미구현)
-1. 검색 결과 1페이지 초과 시 페이지네이션(Next Page) 추가 수집
-2. 사진 기사 설명 추출 지원 대상 언론사 확대 (현재 뉴스1 지원)
-3. 핵심 키워드 추출 및 본문 요약
-4. 로그인 필요 사이트 및 로그인 상태 판정
+## 사용자 수동 확인 대기 및 남은 한계
+- **GUI 수동 테스트 대기**:
+  - 실제 앱 창에서 2번 결과 행 클릭 시 3번 상세 창이 미닫이문처럼 부드럽게 스르륵 열리고, 같은 행 재클릭 시 부드럽게 닫히는지 체감 확인
+  - 다른 행 클릭 시 깜빡임 없이 새로운 내용으로 전환되며 열린 상태가 유지되는지 확인
+  - 행 클릭(상세 창 열기/닫기)과 `'링크 열기'` 버튼 클릭(기본 브라우저 실행)의 분리 체감 확인
+  - 우측 상단 패널 프리셋 아이콘(`전체`/`1,2`/`2,4`) 및 각 패널 우측 상단 `전체`/`기본`/`숨기기` 버튼 동작 확인
+  - `'JSON 저장'`/`'CSV 저장'`으로 다른 폴더에 내보낸 뒤 `'저장 폴더 열기'` 클릭 시 해당 탐색기 창이 열리는지 확인
+- **남은 한계 (알려진 제약)**:
+  - 네이버/구글 이용약관 및 robots.txt 제약, 구글 CAPTCHA 발생 시 사용자 수동 확인 필요
+  - 서버 응답이 타임아웃되거나(예: `cudo.co.kr` 접속 지연), 로그인/스크립트 실행 후에만 렌더링되는 SPA·폐쇄형 페이지는 `failed` 또는 `blocked`로 기록됨
+  - 유튜브 영상·인스타그램 피드·PDF 등 비문서 URL은 텍스트 본문 추출 대상이 아니므로 `unsupported`(`미지원 유형`)로 분류함
 
 ## 변경하면 안 되는 결정
 - Playwright async API, 전용 스레드 asyncio 실행부, Qt 시그널로 GUI 전달

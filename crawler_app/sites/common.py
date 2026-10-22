@@ -1,7 +1,8 @@
 """사이트 모듈이 함께 쓰는 Playwright 동작과 실행 규약.
 
 사이트 모듈 규약 (sites/naver.py, sites/google.py):
-- SITE_ID, DISPLAY_NAME, PROFILE_NAME, SUPPORTED_SEARCH_TYPES 상수
+- SITE_ID, DISPLAY_NAME, PROFILE_NAME, SUPPORTED_SEARCH_TYPES, REQUIRES_LOGIN, LOGIN_URL 상수
+- async def check_login(page) -> bool
 - async def run(page, query, ctx) -> list[ResultItem]
 - 사이트 화면 구조에 의존하는 선택자는 각 사이트 모듈 상단 상수에 모은다.
 """
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 LocatorFactory = Callable[[Any], Any]          # page -> Locator
 Detector = Callable[[Any], Awaitable[str | None]]
+LoginChecker = Callable[[Any], Awaitable[bool]]
 
 
 class SiteError(RuntimeError):
@@ -29,7 +31,7 @@ class SiteError(RuntimeError):
 
 
 class SiteBlocked(SiteError):
-    """접근 제한·추가 인증·CAPTCHA가 계속 보여 중지한 경우."""
+    """접근 제한·추가 인증·CAPTCHA·로그인 미완료가 계속 보여 중지한 경우."""
 
 
 def host_of(url: str | None) -> str:
@@ -44,6 +46,81 @@ def host_of(url: str | None) -> str:
 def host_matches(url: str | None, domains: Sequence[str]) -> bool:
     host = host_of(url)
     return any(host == d or host.endswith("." + d) for d in domains)
+
+
+async def has_auth_cookies(page: Any, cookie_names: Sequence[str],
+                           domain_keywords: Sequence[str]) -> bool:
+    """컨텍스트 쿠키 중 지정된 도메인의 인증 쿠키가 모두 존재하는지 확인한다."""
+    try:
+        cookies = await page.context.cookies()
+    except Exception:
+        return False
+    found: set[str] = set()
+    for c in cookies:
+        domain = (c.get("domain") or "").lower()
+        name = c.get("name") or ""
+        value = c.get("value") or ""
+        if value and any(dk in domain for dk in domain_keywords):
+            found.add(name)
+    return all(req in found for req in cookie_names)
+
+
+async def ensure_login(
+    page: Any,
+    home_url: str,
+    login_url: str | None,
+    check_fn: LoginChecker,
+    ctx: "SiteRunContext",
+    site_requires_login: bool = False,
+) -> bool:
+    """실제 로그인 여부를 판정하고, 로그인이 필요한 경우 사용자 수동 로그인 후 재확인한다.
+
+    프로필 폴더가 존재한다는 이유만으로 로그인 성공으로 간주하지 않고 check_fn으로 검증한다.
+    """
+    ctx.checkpoint("로그인 상태 확인")
+    is_logged = await check_fn(page)
+    ctx.logged_in = is_logged
+    must_login = site_requires_login or getattr(ctx, "require_login", False)
+
+    if is_logged:
+        ctx.info("로그인 상태 판정: 로그인됨 (전용 프로필 세션 확인)")
+        return True
+
+    if not must_login:
+        ctx.info("로그인 상태 판정: 비로그인 (공개 검색 모드로 계속 진행)")
+        return False
+
+    ctx.warning("로그인이 필요한 작업이지만 현재 비로그인 상태입니다.")
+    if login_url and not page.url.startswith(login_url):
+        try:
+            await page.goto(login_url, wait_until="domcontentloaded",
+                            timeout=ctx.navigation_timeout_ms)
+        except PlaywrightError as exc:
+            ctx.warning(f"로그인 페이지 이동 중 경고: {exc}")
+
+    rounds = 0
+    max_rounds = getattr(ctx, "_max_rounds", 3)
+    while not is_logged:
+        rounds += 1
+        if rounds > max_rounds:
+            raise SiteBlocked(f"사용자 확인 {max_rounds}회 후에도 로그인 상태가 확인되지 않아 중지했습니다")
+        await ctx.request_user(
+            "로그인이 필요합니다. 열린 브라우저에서 직접 로그인한 뒤 앱의 '계속' 버튼을 누르세요."
+        )
+        # 로그인 후 홈 화면으로 이동해 상태를 다시 검증한다.
+        if not host_matches(page.url, [host_of(home_url)]):
+            try:
+                await page.goto(home_url, wait_until="domcontentloaded",
+                                timeout=ctx.navigation_timeout_ms)
+            except PlaywrightError:
+                pass
+        is_logged = await check_fn(page)
+        ctx.logged_in = is_logged
+
+    ctx.info("수동 로그인 확인 완료 - 자동화를 재개합니다")
+    if not page.url.startswith(home_url):
+        await goto_home(page, home_url, ctx)
+    return True
 
 
 async def goto_home(page: Any, url: str, ctx: "SiteRunContext") -> None:
@@ -118,11 +195,7 @@ async def open_tab(page: Any, tab_candidates: Sequence[LocatorFactory],
 async def detect_block(page: Any, url_patterns: Sequence[re.Pattern[str]],
                        selectors: Sequence[str], text_markers: Sequence[str],
                        short_page_chars: int = 5_000) -> str | None:
-    """접근 제한·인증 화면으로 보이면 이유 문자열, 아니면 None.
-
-    판정은 휴리스틱이며 사용자 검증 대기 상태다. 결과 기사 제목에 같은 단어가
-    들어 있는 오탐을 줄이기 위해, 문구 검사는 본문이 짧은 화면에서만 한다.
-    """
+    """접근 제한·인증 화면으로 보이면 이유 문자열, 아니면 None."""
     url = page.url
     for pattern in url_patterns:
         if pattern.search(url):
